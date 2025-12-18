@@ -1,7 +1,6 @@
 streamlit
-numpy
+numpy==2.0.2
 pandas
 matplotlib
 seaborn
-plotly
 gymnasium

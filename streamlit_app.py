@@ -1,606 +1,203 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import time
-from collections import deque, defaultdict
+import os
 import pickle
+import __main__ 
 
-# Import your environment and agent classes
-# Update these imports with your actual file names
-from code_v1 import VentilationEnvironment
-from code_v1 import DynaQAgent
+# 1. 核心修复：挂载类以修复 Pickle 加载问题
+from code_v1 import VentilationEnvironment, SarsaAgent, EpsilonGreedy, Softmax, UCB, RandomExploration
+__main__.SarsaAgent = SarsaAgent
+__main__.VentilationEnvironment = VentilationEnvironment
+__main__.EpsilonGreedy = EpsilonGreedy
 
-st.set_page_config(
-    page_title="Smart Ventilation Control",
-    page_icon="🌬️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Smart Ventilation Sarsa Control", page_icon="🌬️", layout="wide")
 
-# Custom CSS
+# --- 最终版 CSS：强化图表标题、强制白底、深色数值 ---
 st.markdown("""
 <style>
-    .big-metric {
-        font-size: 2.5rem;
-        font-weight: bold;
-        text-align: center;
+    /* 1. 全局背景 */
+    .stApp { background-color: ##0E1117 !important; }
+
+    /* 2. Metric 卡片样式 */
+    .big-metric { 
+        font-size: 2.5rem; font-weight: 800; text-align: center; 
+        color: #1E1E1E !important; margin: 0.2rem 0; 
     }
-    .status-good {
-        color: #28a745;
+    .metric-box { 
+        background-color: #ffffff !important; padding: 1.2rem; border-radius: 0.8rem; 
+        margin: 0.5rem 0; text-align: center; border: 2px solid #E0E0E0 !important; 
+        min-height: 140px; display: flex; flex-direction: column; justify-content: center;
     }
-    .status-warning {
-        color: #ffc107;
+    .status-good-border { border-color: #28a745 !important; border-width: 3px !important; }
+    .status-danger-border { border-color: #dc3545 !important; border-width: 3px !important; }
+    .metric-label { font-size: 0.95rem; font-weight: 600; color: #555555 !important; }
+    .metric-unit { font-size: 0.8rem; color: #888888 !important; }
+
+    /* 3. 图表标题放大设置 */
+    .chart-title {
+        font-size: 1.4rem !important; /* 放大标题字号 */
+        font-weight: 700 !important;   /* 加粗 */
+        color: #ffffff !important;     /* 亮白色以便在深色背景下阅读 */
+        margin-bottom: 8px !important;
+        display: block;
     }
-    .status-danger {
-        color: #dc3545;
+
+    /* 4. 强制图表内部 Canvas 完全变白 */
+    [data-testid="stVegaLiteChart"] {
+        padding: 10px !important;
+        border-radius: 12px !important;
     }
-    .metric-box {
-        background-color: #f0f2f6;
-        padding: 1.5rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-        text-align: center;
+    [data-testid="stVegaLiteChart"] svg { background-color: white !important; }
+
+    /* 强制坐标轴文字和标签为深灰色 */
+    [data-testid="stVegaLiteChart"] g.mark-text text, 
+    [data-testid="stVegaLiteChart"] g.role-axis text,
+    [data-testid="stVegaLiteChart"] g.role-legend text {
+        fill: #31333F !important;
+        font-size: 11px !important;
+    }
+    [data-testid="stVegaLiteChart"] g.role-axis path,
+    [data-testid="stVegaLiteChart"] g.role-axis line {
+        stroke: #D0D0D0 !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Load pre-trained agent (cached)
+# --- 资源加载 ---
 @st.cache_resource
 def load_pretrained_agent():
-    """Load your pre-trained agent"""
+    model_path = "agent.pkl" 
+    if not os.path.exists(model_path): return None, "Model not found"
     try:
-        # Update with your model path
-        model_path = "agent.pkl"  # Change this to your model filename
-        
-        with open(model_path, 'rb') as f:
-            data = pickle.load(f)
-        
-        # Reconstruct agent with proper parameters
-        agent = DynaQAgent(
-            n_actions=5,
-            learning_rate=0.1,
-            discount_factor=0.99,
-            planning_steps=5,
-            state_discretization=(20, 5, 2, 5),
-            exploration_strategy="softmax",
-            temperature=1.0,
-            temp_min=0.01,
-            temp_decay=0.999,
-            use_replay=True,
-            replay_buffer_size=10000,
-            replay_batch_size=32
-        )
-        
-        # Load the saved Q-table and model
-        agent.q_table = defaultdict(lambda: np.zeros(agent.n_actions), data['q_table'])
-        agent.model = data['model']
-        agent.episode_rewards = data.get('episode_rewards', [])
-        agent.episode_steps = data.get('episode_steps', [])
-        
-        return agent, None
-    except FileNotFoundError:
-        return None, "Model file not found. Please ensure the model file is in the same directory."
-    except Exception as e:
-        return None, f"Error loading agent: {str(e)}"
+        with open(model_path, 'rb') as f: return pickle.load(f), None 
+    except Exception as e: return None, str(e)
 
-# Create environment (cached)
 @st.cache_resource
 def create_environment():
-    """Create environment with fixed parameters"""
-    try:
-        env = VentilationEnvironment(
-            max_steps=96,
-            dt=5.0,
-            room_area=50.0,
-            room_height=3.0,
-            co2_setpoint=1500.0,
-            co2_outdoor=406.0,
-            k_iaq=10.0,
-            k_energy=0.0002,
-            k_switch=10.0,
-            discrete_actions_count=5
-        )
-        return env, None
-    except Exception as e:
-        return None, f"Error creating environment: {str(e)}"
+    try: return VentilationEnvironment(max_steps=96, discrete_actions_count=5), None
+    except Exception as e: return None, str(e)
 
-# Initialize session state
-if 'simulation_data' not in st.session_state:
-    st.session_state.simulation_data = {
-        'co2_history': deque(maxlen=200),
-        'fan_speed_history': deque(maxlen=200),
-        'occupancy_history': deque(maxlen=200),
-        'reward_history': deque(maxlen=200),
-        'energy_history': deque(maxlen=200),
-        'time_steps': deque(maxlen=200)
-    }
-if 'current_step' not in st.session_state:
-    st.session_state.current_step = 0
-if 'simulation_running' not in st.session_state:
-    st.session_state.simulation_running = False
-if 'env' not in st.session_state:
-    st.session_state.env = None
-if 'agent' not in st.session_state:
-    st.session_state.agent = None
-if 'observation' not in st.session_state:
-    st.session_state.observation = None
-if 'state' not in st.session_state:
-    st.session_state.state = None
+# --- 初始化 Session State ---
 if 'initialized' not in st.session_state:
-    st.session_state.initialized = False
-
-def reset_simulation():
-    """Reset simulation to initial state"""
-    if st.session_state.env is not None:
-        observation, info = st.session_state.env.reset()
-        st.session_state.observation = observation
-        if st.session_state.agent is not None:
-            st.session_state.state = st.session_state.agent.discretize_state(observation)
-    
-    # Clear history
-    for key in st.session_state.simulation_data:
-        st.session_state.simulation_data[key].clear()
-    
+    agent, _ = load_pretrained_agent()
+    env, _ = create_environment()
+    st.session_state.agent = agent
+    st.session_state.env = env
     st.session_state.current_step = 0
+    st.session_state.cum_reward = 0.0
+    st.session_state.simulation_running = False
+    st.session_state.last_obs = [406.0, 0.0, 0.0, 0.0]
+    st.session_state.last_info = {'energy_consumed': 0.0}
+    st.session_state.history_df = pd.DataFrame(columns=[
+        "Time", "CO2", "Setpoint", "Fan", "Energy", "People", "Step Reward", "Total Reward"
+    ]).set_index("Time")
+    st.session_state.initialized = True
 
-def create_co2_chart(time_data, co2_data, setpoint, outdoor):
-    """Create CO2 chart using Plotly"""
-    fig = go.Figure()
-    
-    # CO2 line
-    fig.add_trace(go.Scatter(
-        x=list(time_data),
-        y=list(co2_data),
-        mode='lines',
-        name='CO₂ Level',
-        line=dict(color='#1f77b4', width=2)
-    ))
-    
-    # Setpoint line
-    fig.add_trace(go.Scatter(
-        x=list(time_data),
-        y=[setpoint] * len(time_data),
-        mode='lines',
-        name='Setpoint',
-        line=dict(color='red', width=2, dash='dash')
-    ))
-    
-    # Outdoor line
-    fig.add_trace(go.Scatter(
-        x=list(time_data),
-        y=[outdoor] * len(time_data),
-        mode='lines',
-        name='Outdoor',
-        line=dict(color='green', width=2, dash='dash')
-    ))
-    
-    fig.update_layout(
-        title='Indoor CO₂ Concentration',
-        xaxis_title='Time (hours)',
-        yaxis_title='CO₂ (ppm)',
-        height=300,
-        margin=dict(l=50, r=50, t=50, b=50),
-        hovermode='x unified'
-    )
-    
-    return fig
-
-def create_fan_chart(time_data, fan_data):
-    """Create Fan Speed chart using Plotly"""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=list(time_data),
-        y=list(fan_data),
-        mode='lines',
-        name='Fan Speed',
-        fill='tozeroy',
-        line=dict(color='#ff7f0e', width=2)
-    ))
-    
-    fig.update_layout(
-        title='Ventilation Fan Speed',
-        xaxis_title='Time (hours)',
-        yaxis_title='Fan Speed (%)',
-        height=300,
-        margin=dict(l=50, r=50, t=50, b=50),
-        hovermode='x unified',
-        yaxis=dict(range=[0, 105])
-    )
-    
-    return fig
-
-def create_combined_chart(time_data, energy_data, occupancy_data, max_occ):
-    """Create combined Energy and Occupancy chart using Plotly"""
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # Energy line
-    fig.add_trace(
-        go.Scatter(
-            x=list(time_data),
-            y=list(energy_data),
-            mode='lines',
-            name='Energy',
-            line=dict(color='#2ca02c', width=2)
-        ),
-        secondary_y=False
-    )
-    
-    # Occupancy line
-    fig.add_trace(
-        go.Scatter(
-            x=list(time_data),
-            y=list(occupancy_data),
-            mode='lines',
-            name='Occupancy',
-            fill='tozeroy',
-            line=dict(color='#d62728', width=2),
-            opacity=0.7
-        ),
-        secondary_y=True
-    )
-    
-    fig.update_layout(
-        title='Energy Consumption & Room Occupancy',
-        xaxis_title='Time (hours)',
-        height=300,
-        margin=dict(l=50, r=50, t=50, b=50),
-        hovermode='x unified'
-    )
-    
-    fig.update_yaxes(title_text="Energy (Wh)", secondary_y=False)
-    fig.update_yaxes(title_text="Occupancy (people)", secondary_y=True, range=[0, max_occ + 1])
-    
-    return fig
-
-# Load agent and environment on startup
-if not st.session_state.initialized:
-    agent, agent_error = load_pretrained_agent()
-    env, env_error = create_environment()
-    
-    if agent_error:
-        st.error(f"❌ Agent Loading Error: {agent_error}")
-    if env_error:
-        st.error(f"❌ Environment Error: {env_error}")
-    
-    if agent is not None and env is not None:
-        st.session_state.agent = agent
-        st.session_state.env = env
-        reset_simulation()
-        st.session_state.initialized = True
-
-# Main App
-st.title("🌬️ Smart Ventilation Control System - Live Demo")
-
-# Check if system is ready
-if st.session_state.agent is None or st.session_state.env is None:
-    st.error("""
-    ❌ **System Not Ready**
-    
-    Please ensure:
-    1. Your trained agent file exists (default: `dynaq_softmax_agent.pkl`)
-    2. VentilationEnvironment and DynaQAgent classes are properly imported
-    3. All dependencies are installed
-    """)
-    st.stop()
-
-# Sidebar - Controls
+# --- 侧边栏 ---
 st.sidebar.title("🎮 Control Panel")
-
-# System Status
-st.sidebar.markdown("### 📊 System Status")
-st.sidebar.success("✅ Agent Loaded")
-st.sidebar.success("✅ Environment Ready")
-st.sidebar.info(f"🏢 Room: {st.session_state.env.room_area}m² × {st.session_state.env.room_height}m")
-st.sidebar.info(f"👥 Max Occupancy: {st.session_state.env.max_occupancy} people")
-
-st.sidebar.markdown("---")
-
-# Occupancy Control
-st.sidebar.markdown("### 👥 Occupancy Control")
-
-max_occupancy = st.session_state.env.max_occupancy
-
-manual_occupancy = st.sidebar.slider(
-    "Number of People",
-    min_value=0,
-    max_value=max_occupancy,
-    value=0,
-    step=1,
-    help=f"Set room occupancy (Max: {max_occupancy})"
-)
-
-use_manual_occupancy = st.sidebar.checkbox(
-    "Override Occupancy",
-    value=False,
-    help="Check to manually control occupancy instead of using automatic meeting schedule"
-)
-
-if use_manual_occupancy:
-    st.sidebar.info(f"🔧 Manual Mode: {manual_occupancy} people")
-else:
-    st.sidebar.info("🤖 Automatic Mode: Using meeting schedule")
-
-st.sidebar.markdown("---")
-
-# Simulation Controls
-st.sidebar.markdown("### ⚙️ Simulation Controls")
-
-col1, col2 = st.sidebar.columns(2)
-
-with col1:
-    if st.button("▶️ Start", use_container_width=True):
-        st.session_state.simulation_running = True
-
-with col2:
-    if st.button("⏸️ Pause", use_container_width=True):
-        st.session_state.simulation_running = False
-
+if st.sidebar.button("▶️ Start / Resume", use_container_width=True):
+    st.session_state.simulation_running = True
+if st.sidebar.button("⏸️ Pause", use_container_width=True):
+    st.session_state.simulation_running = False
 if st.sidebar.button("🔄 Reset", use_container_width=True):
-    reset_simulation()
+    st.session_state.current_step = 0
+    st.session_state.cum_reward = 0.0
+    st.session_state.simulation_running = False
+    st.session_state.last_obs = [406.0, 0.0, 0.0, 0.0]
+    st.session_state.last_info = {'energy_consumed': 0.0}
+    st.session_state.history_df = st.session_state.history_df.iloc[0:0] 
     st.rerun()
 
-# Speed control
-simulation_speed = st.sidebar.slider(
-    "Simulation Speed",
-    min_value=0.1,
-    max_value=3.0,
-    value=1.0,
-    step=0.1,
-    help="Controls how fast the simulation runs"
-)
+sim_speed = st.sidebar.slider("Speed", 0.5, 10.0, 2.0)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### ℹ️ About")
-st.sidebar.caption(f"Agent: {st.session_state.agent.exploration_strategy.name}")
-st.sidebar.caption(f"Q-table size: {len(st.session_state.agent.q_table)}")
-st.sidebar.caption(f"Model size: {len(st.session_state.agent.model)}")
+# --- 布局：Metrics ---
+st.markdown("### 📊 Live Performance")
+m_cols = st.columns(5)
+metric_placeholders = [col.empty() for col in m_cols]
 
-# Main Content Area
-metrics_container = st.container()
-charts_container = st.container()
-details_container = st.container()
+def render_metrics(obs, info, total_reward, env):
+    co2_status = "status-good-border" if obs[0] < env.co2_setpoint else "status-danger-border"
+    data = [
+        ("CO₂", f"{obs[0]:.0f}", "ppm", co2_status),
+        ("Fan Speed", f"{obs[1]*100:.0f}", "%", ""),
+        ("People", f"{int(obs[3])}", "person", ""),
+        ("Energy", f"{info['energy_consumed']:.1f}", "Wh", ""),
+        ("Total Reward", f"{total_reward:.1f}", "pts", "")
+    ]
+    for i, (label, val, unit, border) in enumerate(data):
+        metric_placeholders[i].markdown(
+            f'<div class="metric-box {border}"><div class="metric-label">{label}</div>'
+            f'<div class="big-metric">{val}</div><div class="metric-unit">{unit}</div></div>', 
+            unsafe_allow_html=True
+        )
 
-# Metrics Display
-with metrics_container:
-    st.markdown("### 📊 Real-Time Metrics")
-    
-    metric_cols = st.columns(5)
-    
-    # Placeholders for metrics
-    co2_placeholder = metric_cols[0].empty()
-    fan_placeholder = metric_cols[1].empty()
-    occupancy_placeholder = metric_cols[2].empty()
-    energy_placeholder = metric_cols[3].empty()
-    reward_placeholder = metric_cols[4].empty()
+# --- 布局：Charts (标题放大处理) ---
+st.markdown("---")
+h_df = st.session_state.history_df
 
-# Charts Display
-with charts_container:
-    st.markdown("### 📈 Live Charts")
-    
-    chart_col1, chart_col2 = st.columns(2)
-    
-    with chart_col1:
-        co2_chart_placeholder = st.empty()
-    
-    with chart_col2:
-        fan_chart_placeholder = st.empty()
-    
-    energy_chart_placeholder = st.empty()
+col_l, col_r = st.columns(2)
+with col_l:
+    st.markdown('<span class="chart-title">CO2 Level (ppm)</span>', unsafe_allow_html=True)
+    co2_chart = st.line_chart(h_df[["CO2", "Setpoint"]])
+with col_r:
+    st.markdown('<span class="chart-title">Fan Speed (%)</span>', unsafe_allow_html=True)
+    fan_chart = st.line_chart(h_df[["Fan"]])
 
-# Detailed Information
-with details_container:
-    st.markdown("### 📋 Episode Information")
-    
-    detail_cols = st.columns(4)
-    
-    step_placeholder = detail_cols[0].empty()
-    time_placeholder = detail_cols[1].empty()
-    violations_placeholder = detail_cols[2].empty()
-    compliance_placeholder = detail_cols[3].empty()
+col_l2, col_r2 = st.columns(2)
+with col_l2:
+    st.markdown('<span class="chart-title">Energy Consumption (Wh)</span>', unsafe_allow_html=True)
+    energy_chart = st.line_chart(h_df[["Energy"]])
+with col_r2:
+    st.markdown('<span class="chart-title">Occupancy (People)</span>', unsafe_allow_html=True)
+    occ_chart = st.line_chart(h_df[["People"]])
 
-# Simulation Loop
+col_l3, col_r3 = st.columns(2)
+with col_l3:
+    st.markdown('<span class="chart-title">Step Reward</span>', unsafe_allow_html=True)
+    step_rew_chart = st.line_chart(h_df[["Step Reward"]])
+with col_r3:
+    st.markdown('<span class="chart-title">Cumulative Reward</span>', unsafe_allow_html=True)
+    cum_rew_chart = st.line_chart(h_df[["Total Reward"]])
+
+render_metrics(st.session_state.last_obs, st.session_state.last_info, st.session_state.cum_reward, st.session_state.env)
+
+# --- 模拟循环 ---
 if st.session_state.simulation_running:
-    
-    env = st.session_state.env
-    agent = st.session_state.agent
-    
-    # Get current state
-    if st.session_state.observation is None:
-        observation, _ = env.reset()
-        st.session_state.observation = observation
-        st.session_state.state = agent.discretize_state(observation)
-    
-    # Override occupancy if manual control is enabled
-    if use_manual_occupancy:
-        env.occupancy = manual_occupancy
-        env.light_level = 1.0 if manual_occupancy > 0 else 0.0
-        st.session_state.observation[3] = float(manual_occupancy)
-        st.session_state.state = agent.discretize_state(st.session_state.observation)
-    
-    # Agent selects action
-    action = agent.select_action(st.session_state.state, training=False)
-    
-    # Environment step
-    observation, reward, terminated, truncated, info = env.step(action)
-    
-    # Override occupancy again after step if manual control
-    if use_manual_occupancy:
-        env.occupancy = manual_occupancy
-        env.light_level = 1.0 if manual_occupancy > 0 else 0.0
-        observation[3] = float(manual_occupancy)
-    
-    st.session_state.observation = observation
-    st.session_state.state = agent.discretize_state(observation)
-    
-    # Store data
-    current_time = st.session_state.current_step * env.dt / 60.0  # hours
-    st.session_state.simulation_data['time_steps'].append(current_time)
-    st.session_state.simulation_data['co2_history'].append(observation[0])
-    st.session_state.simulation_data['fan_speed_history'].append(observation[1] * 100)
-    st.session_state.simulation_data['occupancy_history'].append(observation[3])
-    st.session_state.simulation_data['reward_history'].append(reward)
-    st.session_state.simulation_data['energy_history'].append(info['energy_consumed'])
-    
-    st.session_state.current_step += 1
-    
-    # Update Metrics
-    co2_level = observation[0]
-    co2_status = "status-good" if co2_level < env.co2_setpoint else "status-danger"
-    
-    co2_placeholder.markdown(f"""
-    <div class="metric-box">
-        <div style="color: #666; font-size: 0.9rem;">CO₂ Level</div>
-        <div class="big-metric {co2_status}">{co2_level:.0f}</div>
-        <div style="color: #666; font-size: 0.8rem;">ppm</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    fan_placeholder.markdown(f"""
-    <div class="metric-box">
-        <div style="color: #666; font-size: 0.9rem;">Fan Speed</div>
-        <div class="big-metric">{observation[1]*100:.0f}</div>
-        <div style="color: #666; font-size: 0.8rem;">%</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    occupancy_placeholder.markdown(f"""
-    <div class="metric-box">
-        <div style="color: #666; font-size: 0.9rem;">Occupancy</div>
-        <div class="big-metric">{int(observation[3])}</div>
-        <div style="color: #666; font-size: 0.8rem;">people</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    energy_placeholder.markdown(f"""
-    <div class="metric-box">
-        <div style="color: #666; font-size: 0.9rem;">Energy Used</div>
-        <div class="big-metric">{info['energy_consumed']:.1f}</div>
-        <div style="color: #666; font-size: 0.8rem;">Wh</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    reward_color = "status-good" if reward > 0 else "status-danger"
-    reward_placeholder.markdown(f"""
-    <div class="metric-box">
-        <div style="color: #666; font-size: 0.9rem;">Reward</div>
-        <div class="big-metric {reward_color}">{reward:.1f}</div>
-        <div style="color: #666; font-size: 0.8rem;">current</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Update Charts using Plotly (only update every N steps for better performance)
-    if len(st.session_state.simulation_data['time_steps']) > 1:
-        
-        # CO2 Chart
-        co2_fig = create_co2_chart(
-            st.session_state.simulation_data['time_steps'],
-            st.session_state.simulation_data['co2_history'],
-            env.co2_setpoint,
-            env.co2_outdoor
-        )
-        co2_chart_placeholder.plotly_chart(co2_fig, use_container_width=True, key=f"co2_{st.session_state.current_step}")
-        
-        # Fan Speed Chart
-        fan_fig = create_fan_chart(
-            st.session_state.simulation_data['time_steps'],
-            st.session_state.simulation_data['fan_speed_history']
-        )
-        fan_chart_placeholder.plotly_chart(fan_fig, use_container_width=True, key=f"fan_{st.session_state.current_step}")
-        
-        # Combined Chart
-        combined_fig = create_combined_chart(
-            st.session_state.simulation_data['time_steps'],
-            st.session_state.simulation_data['energy_history'],
-            st.session_state.simulation_data['occupancy_history'],
-            env.max_occupancy
-        )
-        energy_chart_placeholder.plotly_chart(combined_fig, use_container_width=True, key=f"energy_{st.session_state.current_step}")
-    
-    # Update Detail Info
-    step_placeholder.metric("Step", f"{st.session_state.current_step}/{env.max_steps}")
-    time_placeholder.metric("Time", f"{current_time:.2f} hours")
-    violations_placeholder.metric("IAQ Violations", info['iaq_violations'])
-    compliance_placeholder.metric("Compliance Rate", f"{info['iaq_compliance_rate']*100:.1f}%")
-    
-    # Check if episode ended
-    if terminated or truncated:
-        st.session_state.simulation_running = False
-        st.success(f"""
-        ✅ **Episode Complete!**
-        - Total Reward: {info['total_reward']:.2f}
-        - IAQ Compliance: {info['iaq_compliance_rate']*100:.1f}%
-        - Energy Consumed: {info['energy_consumed']:.2f} Wh
-        - IAQ Violations: {info['iaq_violations']}
-        """)
-        st.balloons()
-    
-    # Control simulation speed
-    time.sleep(0.05 / simulation_speed)
-    
-    # Rerun to continue simulation
-    st.rerun()
+    env, agent = st.session_state.env, st.session_state.agent
+    if st.session_state.current_step == 0:
+        obs, _ = env.reset()
+        st.session_state.last_obs, st.session_state.state = obs, agent.discretize_state(obs)
 
-else:
-    # Simulation paused - show current state
-    if st.session_state.observation is not None:
-        st.info("⏸️ Simulation paused. Click 'Start' to continue or 'Reset' to restart.")
+    while st.session_state.simulation_running and st.session_state.current_step < env.max_steps:
+        action = agent.select_action(st.session_state.state, training=False)
+        obs, reward, term, trun, info = env.step(action)
         
-        # Show current metrics even when paused
-        observation = st.session_state.observation
-        env = st.session_state.env
+        st.session_state.last_obs, st.session_state.last_info = obs, info
+        st.session_state.state = agent.discretize_state(obs)
+        st.session_state.current_step += 1
+        st.session_state.cum_reward += reward
         
-        co2_level = observation[0]
-        co2_status = "status-good" if co2_level < env.co2_setpoint else "status-danger"
+        cur_time = st.session_state.current_step * env.dt / 60.0
+        new_row = pd.DataFrame({
+            "CO2": [obs[0]], "Setpoint": [env.co2_setpoint], "Fan": [obs[1]*100],
+            "Energy": [info['energy_consumed']], "People": [obs[3]], 
+            "Step Reward": [reward], "Total Reward": [st.session_state.cum_reward]
+        }, index=[cur_time])
         
-        co2_placeholder.markdown(f"""
-        <div class="metric-box">
-            <div style="color: #666; font-size: 0.9rem;">CO₂ Level</div>
-            <div class="big-metric {co2_status}">{co2_level:.0f}</div>
-            <div style="color: #666; font-size: 0.8rem;">ppm</div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.session_state.history_df = pd.concat([st.session_state.history_df, new_row])
+        render_metrics(obs, info, st.session_state.cum_reward, env)
         
-        fan_placeholder.markdown(f"""
-        <div class="metric-box">
-            <div style="color: #666; font-size: 0.9rem;">Fan Speed</div>
-            <div class="big-metric">{observation[1]*100:.0f}</div>
-            <div style="color: #666; font-size: 0.8rem;">%</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        occupancy_placeholder.markdown(f"""
-        <div class="metric-box">
-            <div style="color: #666; font-size: 0.9rem;">Occupancy</div>
-            <div class="big-metric">{int(observation[3])}</div>
-            <div style="color: #666; font-size: 0.8rem;">people</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Show last known charts
-        if len(st.session_state.simulation_data['time_steps']) > 1:
-            co2_fig = create_co2_chart(
-                st.session_state.simulation_data['time_steps'],
-                st.session_state.simulation_data['co2_history'],
-                env.co2_setpoint,
-                env.co2_outdoor
-            )
-            co2_chart_placeholder.plotly_chart(co2_fig, use_container_width=True)
-            
-            fan_fig = create_fan_chart(
-                st.session_state.simulation_data['time_steps'],
-                st.session_state.simulation_data['fan_speed_history']
-            )
-            fan_chart_placeholder.plotly_chart(fan_fig, use_container_width=True)
-            
-            combined_fig = create_combined_chart(
-                st.session_state.simulation_data['time_steps'],
-                st.session_state.simulation_data['energy_history'],
-                st.session_state.simulation_data['occupancy_history'],
-                env.max_occupancy
-            )
-            energy_chart_placeholder.plotly_chart(combined_fig, use_container_width=True)
-    else:
-        st.info("▶️ Click 'Start' to begin the simulation")
+        co2_chart.add_rows(new_row[["CO2", "Setpoint"]])
+        fan_chart.add_rows(new_row[["Fan"]])
+        energy_chart.add_rows(new_row[["Energy"]])
+        occ_chart.add_rows(new_row[["People"]])
+        step_rew_chart.add_rows(new_row[["Step Reward"]])
+        cum_rew_chart.add_rows(new_row[["Total Reward"]])
+
+        if term or trun:
+            st.session_state.simulation_running = False
+            st.balloons()
+            break
+        time.sleep(0.1 / sim_speed)
